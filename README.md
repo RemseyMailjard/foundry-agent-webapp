@@ -1,6 +1,8 @@
-# AI Agent Web App
+# M365 Buddy
 
-AI-powered web application with Entra ID authentication and Foundry Agent Service integration. Deploy to Azure Container Apps with a single command.
+Your AI assistant for Microsoft 365 — built on Entra ID authentication and Azure AI Foundry Agent Service. Deploy to Azure Container Apps with a single command.
+
+> **Milestone status**: this is the M365 Buddy baseline — a rebrand of the upstream Foundry Agent Web App template, proven to build, run, and deploy end-to-end. It is currently a general-purpose Foundry chat assistant; it does **not** yet read email, calendar, files, Teams, or SharePoint. Microsoft Graph integrations (Mail, Calendar, OneDrive, SharePoint, Teams) are planned for a later milestone — see `AI_CONTEXT_M365_BUDDY.md` for the target architecture.
 
 > **⚠️ Coming from the AI Foundry portal?** The portal's "View sample app code" gives you AI resource variables, but this app also needs an **Entra ID app registration** for authentication — which is created by `azd up`. Even if your AI Foundry resources already exist, you must run `azd up` before the app will work. See the [Foundry portal setup](#coming-from-the-ai-foundry-portal) section below.
 

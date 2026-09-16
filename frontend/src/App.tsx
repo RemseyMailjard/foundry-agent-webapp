@@ -41,7 +41,7 @@ function App() {
       setAgentMetadata(data);
       
       // Update document title with agent name
-      document.title = data.name ? `${data.name} - Azure AI Agent` : 'Azure AI Agent';
+      document.title = data.name ? `${data.name} - M365 Buddy` : 'M365 Buddy';
     } catch (error) {
       console.error('Error fetching agent metadata:', error);
       // Fallback data keeps UI functional on error
@@ -49,12 +49,12 @@ function App() {
         id: 'fallback-agent',
         object: 'agent',
         createdAt: Date.now() / 1000,
-        name: 'Azure AI Agent',
-        description: 'Your intelligent conversational partner powered by Azure AI',
+        name: 'M365 Buddy',
+        description: 'Your AI assistant for Microsoft 365',
         model: 'gpt-4o-mini',
         metadata: { logo: 'Avatar_Default.svg' }
       });
-      document.title = 'Azure AI Agent';
+      document.title = 'M365 Buddy';
     } finally {
       setIsLoadingAgent(false);
     }

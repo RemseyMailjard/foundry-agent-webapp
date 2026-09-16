@@ -2,7 +2,7 @@ import type { IChatItem } from '../types/chat';
 
 export function exportAsMarkdown(messages: IChatItem[], agentName?: string): string {
   const lines: string[] = [];
-  lines.push(`# Conversation with ${agentName || 'AI Agent'}`);
+  lines.push(`# Conversation with ${agentName || 'M365 Buddy'}`);
   lines.push(`_Exported ${new Date().toLocaleString()}_\n`);
 
   for (const msg of messages) {
