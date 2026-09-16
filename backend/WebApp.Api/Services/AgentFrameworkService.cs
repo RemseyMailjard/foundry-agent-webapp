@@ -5,8 +5,6 @@ using Azure.Core;
 using Azure.Identity;
 using OpenAI.Files;
 using OpenAI.Responses;
-using Microsoft.Identity.Client;
-using Microsoft.Identity.Web;
 using System.Runtime.CompilerServices;
 using WebApp.Api.Models;
 using WebApp.Api.Services.BuddyTools;
@@ -37,19 +35,13 @@ public class AgentFrameworkService : IDisposable
     /// </summary>
     private readonly string? _configuredAgentVersion;
     private readonly ILogger<AgentFrameworkService> _logger;
-    private readonly IHttpContextAccessor? _httpContextAccessor;
-    private readonly string? _backendClientId;
-    private readonly string? _tenantId;
     private readonly string? _managedIdentityClientId;
-    private readonly bool _useObo;
     private readonly TokenCredential _fallbackCredential;
 
     // Agent metadata cache (static - shared across requests)
     private static ProjectsAgentVersion? s_cachedAgentVersion;
     private static AgentMetadataResponse? s_cachedMetadata;
     private static readonly SemaphoreSlim s_agentLock = new(1, 1);
-    // MI assertion cache (static - user-independent, safe to share across requests)
-    private static ManagedIdentityClientAssertion? s_miAssertion;
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly BuddyToolCatalog _buddyToolCatalog;
@@ -69,13 +61,11 @@ public class AgentFrameworkService : IDisposable
         IConfiguration configuration,
         ILogger<AgentFrameworkService> logger,
         IHttpClientFactory httpClientFactory,
-        BuddyToolCatalog buddyToolCatalog,
-        IHttpContextAccessor? httpContextAccessor = null)
+        BuddyToolCatalog buddyToolCatalog)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _buddyToolCatalog = buddyToolCatalog;
-        _httpContextAccessor = httpContextAccessor;
 
         _agentEndpoint = configuration["AI_AGENT_ENDPOINT"]
             ?? throw new InvalidOperationException("AI_AGENT_ENDPOINT is not configured");
@@ -88,25 +78,23 @@ public class AgentFrameworkService : IDisposable
             : configuration["AI_AGENT_VERSION"];
 
         _logger.LogDebug(
-            "Initializing AgentFrameworkService: endpoint={Endpoint}, agentId={AgentId}, version={Version}", 
-            _agentEndpoint, 
+            "Initializing AgentFrameworkService: endpoint={Endpoint}, agentId={AgentId}, version={Version}",
+            _agentEndpoint,
             _agentId,
             _configuredAgentVersion ?? "<latest>");
 
-        _backendClientId = configuration["ENTRA_BACKEND_CLIENT_ID"];
-        _tenantId = configuration["ENTRA_TENANT_ID"] ?? configuration["AzureAd:TenantId"];
-        // User-assigned MI client ID — used for MI-only mode and as FIC assertion in OBO mode
         _managedIdentityClientId = configuration["MANAGED_IDENTITY_CLIENT_ID"]
             ?? configuration["OBO_MANAGED_IDENTITY_CLIENT_ID"]; // backward compat
 
         var environment = configuration["ASPNETCORE_ENVIRONMENT"] ?? "Production";
 
-        // Determine if OBO is available
-        _useObo = !string.IsNullOrEmpty(_backendClientId)
-                  && !string.IsNullOrEmpty(_tenantId)
-                  && environment != "Development";
-
-        // Create credential for non-OBO operations (agent metadata cache, MI-only mode)
+        // Foundry calls always use the managed identity, regardless of the signed-in user's
+        // tenant. The AI Foundry resource lives in our own subscription and its RBAC is granted
+        // only to this managed identity — an external tenant's user has no Azure role on it, so
+        // per-user OBO here would just 403 for them. (Microsoft Graph access, by contrast, IS
+        // per-user/per-tenant via GraphOboCredentialFactory — that's a different resource with
+        // different, genuinely delegated authorization.) See README's "Multi-tenant sign-in"
+        // section for the full reasoning.
         if (environment == "Development")
         {
             _logger.LogInformation("Development: Using ChainedTokenCredential (AzureCli -> AzureDeveloperCli)");
@@ -126,91 +114,15 @@ public class AgentFrameworkService : IDisposable
             _fallbackCredential = new ManagedIdentityCredential(ManagedIdentityId.SystemAssigned);
         }
 
-        if (_useObo)
-        {
-            if (string.IsNullOrEmpty(_managedIdentityClientId))
-            {
-                throw new InvalidOperationException(
-                    "OBO mode requires MANAGED_IDENTITY_CLIENT_ID to be set for the FIC assertion. " +
-                    "This is the user-assigned managed identity that acts as the federated credential.");
-            }
-            _logger.LogInformation("OBO mode enabled: backendClientId={BackendClientId}. All API calls use user-delegated identity.", _backendClientId);
-
-            // Initialize MI assertion eagerly — avoids thread-safety issues with lazy init
-            // in CreateOboCredential(). Safe here because the constructor runs once per scoped instance.
-            s_miAssertion ??= new ManagedIdentityClientAssertion(managedIdentityClientId: _managedIdentityClientId);
-
-            // No cached project client in OBO mode — created per-request with user's token
-        }
-        else
-        {
-            _logger.LogInformation("MI mode: using managed identity for all API calls");
-            _projectClient = new AIProjectClient(new Uri(_agentEndpoint), _fallbackCredential);
-        }
+        _projectClient = new AIProjectClient(new Uri(_agentEndpoint), _fallbackCredential);
 
         _logger.LogInformation("AIProjectClient initialized successfully");
     }
 
     /// <summary>
-    /// Get AIProjectClient — OBO mode creates per-request with user's identity, MI mode uses cached client.
+    /// Get AIProjectClient (managed identity — see constructor remarks on why Foundry never uses OBO).
     /// </summary>
-    private AIProjectClient GetProjectClient()
-    {
-        // MI mode: return cached client
-        if (!_useObo)
-        {
-            _projectClient ??= new AIProjectClient(new Uri(_agentEndpoint), _fallbackCredential);
-            return _projectClient;
-        }
-
-        // OBO: create per-request client with user's token (cached for request lifetime)
-        if (_projectClient is null)
-        {
-            var userToken = ExtractBearerToken();
-            if (string.IsNullOrEmpty(userToken))
-            {
-                throw new InvalidOperationException(
-                    "OBO mode requires a bearer token but none was found in the request. " +
-                    "Ensure the frontend is sending an Authorization header with a valid token.");
-            }
-
-            var oboCredential = CreateOboCredential(userToken);
-            _logger.LogDebug("Created OBO credential for request");
-            _projectClient = new AIProjectClient(new Uri(_agentEndpoint), oboCredential);
-        }
-
-        return _projectClient;
-    }
-
-    /// <summary>
-    /// Create OBO credential using the user's JWT and managed identity FIC assertion.
-    /// </summary>
-    private OnBehalfOfCredential CreateOboCredential(string userToken)
-    {
-        // s_miAssertion is initialized eagerly in the constructor (OBO branch)
-        Func<CancellationToken, Task<string>> assertionCallback =
-            async (ct) => await s_miAssertion!.GetSignedAssertionAsync(
-                new AssertionRequestOptions { CancellationToken = ct });
-
-        return new OnBehalfOfCredential(
-            _tenantId!,
-            _backendClientId!,
-            assertionCallback,
-            userToken,
-            new OnBehalfOfCredentialOptions());
-    }
-
-    /// <summary>
-    /// Extract bearer token from the current HTTP request.
-    /// </summary>
-    private string? ExtractBearerToken()
-    {
-        var authHeader = _httpContextAccessor?.HttpContext?.Request.Headers.Authorization.ToString();
-        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        return authHeader["Bearer ".Length..].Trim();
-    }
+    private AIProjectClient GetProjectClient() => _projectClient!;
 
     /// <summary>
     /// Load the agent version metadata via AgentAdministrationClient (v2 Agents API).
@@ -1108,20 +1020,8 @@ public class AgentFrameworkService : IDisposable
     {
         _logger.LogInformation("Downloading container file: {FileId} from container: {ContainerId}", fileId, containerId);
 
-        // Reuse the same credential as the project client (MI or OBO)
-        TokenCredential credential;
-        if (_useObo)
-        {
-            var userToken = ExtractBearerToken();
-            credential = CreateOboCredential(userToken ?? throw new InvalidOperationException("OBO requires bearer token"));
-        }
-        else
-        {
-            credential = _fallbackCredential;
-        }
-
         var tokenRequestContext = new TokenRequestContext(["https://ai.azure.com/.default"]);
-        var accessToken = await credential.GetTokenAsync(tokenRequestContext, cancellationToken);
+        var accessToken = await _fallbackCredential.GetTokenAsync(tokenRequestContext, cancellationToken);
 
         var requestUrl = $"{_agentEndpoint.TrimEnd('/')}/openai/v1/containers/{Uri.EscapeDataString(containerId)}/files/{Uri.EscapeDataString(fileId)}/content";
         using var httpClient = _httpClientFactory.CreateClient();

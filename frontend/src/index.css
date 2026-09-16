@@ -1,15 +1,50 @@
+/* M365 Buddy brand typeface (see frontend/src/config/themes.ts) */
+@font-face {
+  font-family: 'Parkinsans';
+  src: url('/fonts/Parkinsans-VariableFont_wght.ttf') format('truetype-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Display face for large hero/section headings only — body copy stays Parkinsans (see
+   m365buddy.nl/css/styles.css's --font-display convention). */
+@font-face {
+  font-family: 'TRICK';
+  src: url('/fonts/TRICK-Bold.otf') format('opentype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* Global resets and layout - Fluent UI handles theming */
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
   overflow: hidden;
+  /* Fluent's Text/Title components already use the theme's fontFamilyBase token (set to
+     Parkinsans in config/themes.ts) via the --fontFamilyBase CSS variable FluentProvider
+     injects. This body-level rule is the fallback for plain HTML tags (p, a, div, ...) used
+     directly in the marketing/legal pages, which wouldn't otherwise inherit it. */
+  font-family: var(--fontFamilyBase, 'Parkinsans', 'Segoe UI', sans-serif);
 }
 
 #root {
   width: 100%;
   height: 100vh;
   overflow: hidden;
+}
+
+/* Public marketing/legal pages scroll normally, unlike the fixed-height chat app shell */
+#root:has(.marketing-page) {
+  height: auto;
+  min-height: 100vh;
+  overflow: visible;
+}
+
+body:has(.marketing-page) {
+  overflow: visible;
 }
 
 

@@ -20,10 +20,15 @@ var azureMachineLearningAppId = '18a66f5f-dbdf-4c17-9dd7-1634712a9cbe'
 var azureMachineLearningUserImpersonationScopeId = '1a7925b5-f871-417a-9b8b-303f9f29fa10'
 
 // Microsoft Graph — always present in every tenant. Delegated scopes for the M365 Buddy
-// Graph vertical slice (GET /api/m365/profile, GET /api/m365/mail/recent).
+// Graph vertical slice (GET /api/m365/profile, /mail/recent, /calendar/upcoming, /files/search).
+// Read-only only — write scopes (Mail.ReadWrite, Calendars.ReadWrite, etc.) are deliberately
+// NOT requested yet: write tools require the approval flow from AI_CONTEXT_M365_BUDDY.md §9,
+// which doesn't exist yet.
 var microsoftGraphAppId = '00000003-0000-0000-c000-000000000000'
 var graphUserReadScopeId = 'e1fe6dd8-ba31-4d61-89e7-88639da4683d' // User.Read
 var graphMailReadScopeId = '570282fd-fa5c-430d-a7fd-fc8dc98a9dca' // Mail.Read
+var graphCalendarsReadScopeId = '465a38f9-76ea-45b9-9f34-9e8b0d4b0b42' // Calendars.Read
+var graphFilesReadScopeId = '10465720-29dd-4523-a11a-6a75c743c9d9' // Files.Read
 
 // Deterministic scope ID — stable across redeployments
 var chatReadWriteScopeId = guid(resourceGroup().id, environmentName, 'Chat.ReadWrite')
@@ -35,12 +40,16 @@ var chatReadWriteScopeId = guid(resourceGroup().id, environmentName, 'Chat.ReadW
 resource app 'Microsoft.Graph/applications@v1.0' = {
   uniqueName: 'ai-foundry-agent-${environmentName}'
   displayName: 'ai-foundry-agent-${environmentName}'
-  signInAudience: 'AzureADMyOrg'
+  // Multi-tenant: any Entra work/school tenant can sign in, not just ours. Their admin must
+  // separately consent to this app in their own tenant (see README's admin-consent section) —
+  // our own admin-consent grants below only apply within our home tenant.
+  signInAudience: 'AzureADMultipleOrgs'
   serviceManagementReference: empty(serviceManagementReference) ? null : serviceManagementReference
   spa: {
+    // /app is the only route requiring sign-in — see authConfig.ts's redirectUri comment.
     redirectUris: [
-      'http://localhost:5173'
-      'http://localhost:8080'
+      'http://localhost:5173/app'
+      'http://localhost:8080/app'
     ]
   }
   api: {
@@ -74,7 +83,9 @@ var backendChatScopeId = guid(resourceGroup().id, environmentName, 'Backend.Chat
 resource backendApp 'Microsoft.Graph/applications@v1.0' = if (enableObo) {
   uniqueName: 'ai-foundry-agent-backend-${environmentName}'
   displayName: 'ai-foundry-agent-backend-${environmentName}'
-  signInAudience: 'AzureADMyOrg'
+  // Must match the SPA's multi-tenant audience — a user's token is only valid for OBO into this
+  // app if this app's own audience allows their tenant too.
+  signInAudience: 'AzureADMultipleOrgs'
   serviceManagementReference: empty(serviceManagementReference) ? null : serviceManagementReference
   web: {
     redirectUris: []
@@ -118,6 +129,14 @@ resource backendApp 'Microsoft.Graph/applications@v1.0' = if (enableObo) {
           id: graphMailReadScopeId
           type: 'Scope' // Delegated permission
         }
+        {
+          id: graphCalendarsReadScopeId
+          type: 'Scope' // Delegated permission
+        }
+        {
+          id: graphFilesReadScopeId
+          type: 'Scope' // Delegated permission
+        }
       ]
     }
   ]
@@ -159,12 +178,12 @@ resource microsoftGraphSp 'Microsoft.Graph/servicePrincipals@v1.0' existing = if
   appId: microsoftGraphAppId
 }
 
-// Grant admin consent: backend app → Microsoft Graph / User.Read + Mail.Read
+// Grant admin consent: backend app → Microsoft Graph / User.Read + Mail.Read + Calendars.Read + Files.Read
 resource graphAdminConsent 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = if (enableObo) {
   clientId: backendSp.id
   consentType: 'AllPrincipals'
   resourceId: microsoftGraphSp.id
-  scope: 'User.Read Mail.Read'
+  scope: 'User.Read Mail.Read Calendars.Read Files.Read'
 }
 
 output clientAppId string = app.appId

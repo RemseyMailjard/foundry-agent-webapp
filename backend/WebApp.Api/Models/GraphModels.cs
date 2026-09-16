@@ -22,3 +22,25 @@ public sealed record MailSummaryDto(
     DateTimeOffset? ReceivedDateTime,
     bool IsRead,
     string? BodyPreview);
+
+/// <summary>
+/// Buddy-owned projection of a single Microsoft Graph calendar event.
+/// </summary>
+public sealed record CalendarEventSummaryDto(
+    string Id,
+    string? Subject,
+    DateTimeOffset? Start,
+    DateTimeOffset? End,
+    bool IsAllDay,
+    string? Location,
+    string? OrganizerName);
+
+/// <summary>
+/// Buddy-owned projection of a single Microsoft Graph drive item (file or folder).
+/// </summary>
+public sealed record FileSummaryDto(
+    string Id,
+    string? Name,
+    string? WebUrl,
+    DateTimeOffset? LastModifiedDateTime,
+    long? SizeBytes);

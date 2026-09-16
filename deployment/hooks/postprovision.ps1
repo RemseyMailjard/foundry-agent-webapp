@@ -38,10 +38,11 @@ $identifierUri = "api://$clientId"
 $patchBody = @{
     identifierUris = @($identifierUri)
     spa = @{
+        # /app is the only route requiring sign-in — see frontend authConfig.ts's redirectUri comment.
         redirectUris = @(
-            "http://localhost:8080",
-            "http://localhost:5173",
-            $containerAppUrl
+            "http://localhost:8080/app",
+            "http://localhost:5173/app",
+            "$containerAppUrl/app"
         )
     }
 } | ConvertTo-Json -Depth 10

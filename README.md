@@ -2,7 +2,7 @@
 
 Your AI assistant for Microsoft 365 — built on Entra ID authentication and Azure AI Foundry Agent Service. Deploy to Azure Container Apps with a single command.
 
-> **Milestone status**: the M365 Buddy baseline is rebranded and deployed. A Microsoft Graph delegated vertical slice (`GET /api/m365/profile`, `GET /api/m365/mail/recent`) is available behind OBO, and the chat agent can now call `get_user_profile` and `search_mail` as read-only tools during a conversation — see [Microsoft Graph integration](#microsoft-graph-integration-m365-buddy) below. Calendar, files, Teams, SharePoint, write actions, and approvals are planned for later milestones — see `AI_CONTEXT_M365_BUDDY.md` for the target architecture.
+> **Milestone status**: the M365 Buddy baseline is rebranded and deployed. A Microsoft Graph delegated vertical slice is available behind OBO, and the chat agent can call four read-only tools during a conversation — `get_user_profile`, `search_mail`, `get_calendar`, `search_files` — see [Microsoft Graph integration](#microsoft-graph-integration-m365-buddy) below. Teams, SharePoint, write actions, and approvals are planned for later milestones — see `AI_CONTEXT_M365_BUDDY.md` for the target architecture.
 
 > **⚠️ Coming from the AI Foundry portal?** The portal's "View sample app code" gives you AI resource variables, but this app also needs an **Entra ID app registration** for authentication — which is created by `azd up`. Even if your AI Foundry resources already exist, you must run `azd up` before the app will work. See the [Foundry portal setup](#coming-from-the-ai-foundry-portal) section below.
 
@@ -338,6 +338,21 @@ All resources deploy to the same region (`AZURE_LOCATION`). The managed identity
 
 ## Authentication & Identity
 
+### Multi-tenant sign-in
+
+Both app registrations (`infra/entra-app.bicep`) are `AzureADMultipleOrgs` — any Entra work/school tenant can sign in, not just ours (personal Microsoft accounts are excluded). This required three coordinated changes, not just the `signInAudience` flag:
+
+- **Frontend authority**: `frontend/src/config/authConfig.ts` uses `https://login.microsoftonline.com/organizations`, not a tenant-specific authority — the latter would reject every user outside our own tenant even with the app registration set to multi-tenant.
+- **Backend issuer validation**: `Program.cs` binds `AzureAd:TenantId = "organizations"`, so Microsoft.Identity.Web validates the token issuer against the multi-tenant v2.0 authority.
+- **Graph OBO tenant is per-request, not fixed**: `GraphOboCredentialFactory` reads the signed-in user's tenant from the validated token's `tid` claim for each OBO exchange, instead of a fixed `ENTRA_TENANT_ID` config value — the exchange must be performed against *that user's own* mailbox/calendar/files, which live in their tenant. A hardcoded tenant would silently break every Graph request from outside our own tenant.
+- **Chat (Foundry) deliberately stays Managed-Identity-only, for every tenant.** The AI Foundry resource lives in *our* subscription, and its RBAC (`Cognitive Services User`, `Cognitive Services OpenAI Contributor`, `Azure AI Developer`) is granted only to the container app's managed identity — an external tenant's user has no Azure role on it, so per-user OBO there would just 403. `AgentFrameworkService` no longer has an OBO code path at all (removed, not just gated off) — chat works identically for every signed-in user regardless of tenant, at the cost of no per-user audit trail on Foundry calls specifically (Graph calls remain fully per-user).
+
+**One thing multi-tenant sign-in does *not* do automatically: external tenants still need their own admin consent.** Our declarative `oauth2PermissionGrants` in Bicep only grants consent within our own home tenant. An IT admin in another organization must separately consent to the backend app's Graph permissions (`User.Read`, `Mail.Read`, `Calendars.Read`, `Files.Read`) in *their* tenant before their users can use Graph features (chat itself works regardless, per the MI point above) — e.g. via:
+```text
+https://login.microsoftonline.com/{their-tenant-id-or-domain}/adminconsent?client_id=<backend-app-client-id>&redirect_uri=<your-redirect-uri>
+```
+There's no in-app flow for this yet (the old `m365buddy.nl/admin-consent.html` prototype had one) — for now this is a manual link an admin visits. Until they do, `search_mail`/`get_calendar`/`search_files`/`get_user_profile` will fail for their users with a consent-required error; chat without those tools still works.
+
 ### Default: Managed Identity (Zero-Touch)
 
 By default, `azd up` configures everything automatically:
@@ -428,27 +443,33 @@ This creates a backend API app registration with FIC, sets `api://{backendClient
 
 The first Microsoft Graph delegated vertical slice reuses the same OBO plumbing described above — enable it with `ENABLE_OBO=true` (see [Enable OBO](#enable-obo)). There is no separate flag: when OBO is enabled, the backend app registration is also granted the Graph scopes below.
 
-**Delegated scopes requested** (least privilege, incremental — see `AI_CONTEXT_M365_BUDDY.md` §4.4 for the full planned rollout):
+**Delegated scopes requested** (least privilege, read-only so far — see `AI_CONTEXT_M365_BUDDY.md` §4.4 for the full planned rollout):
 
 | Scope | Purpose |
 |-------|---------|
 | `User.Read` | Read the signed-in user's own profile |
 | `Mail.Read` | Read the signed-in user's own mailbox (read-only) |
+| `Calendars.Read` | Read the signed-in user's own calendar (read-only) |
+| `Files.Read` | Read the signed-in user's own OneDrive files (read-only) |
+
+Write scopes (`Mail.ReadWrite`, `Calendars.ReadWrite`, etc.) are deliberately **not** requested yet — write tools need the approval flow from `AI_CONTEXT_M365_BUDDY.md` §9, which doesn't exist yet. Don't add write scopes without building that first.
 
 **Endpoints**:
 
 ```text
-GET /api/m365/profile          → { id, displayName, userPrincipalName, mail }
-GET /api/m365/mail/recent?top=10 → [{ id, subject, senderName, senderAddress, receivedDateTime, isRead, bodyPreview }]
+GET /api/m365/profile               → { id, displayName, userPrincipalName, mail }
+GET /api/m365/mail/recent?top=10     → [{ id, subject, senderName, senderAddress, receivedDateTime, isRead, bodyPreview }]
+GET /api/m365/calendar/upcoming?days=7 → [{ id, subject, start, end, isAllDay, location, organizerName }]
+GET /api/m365/files/search?q=budget   → [{ id, name, webUrl, lastModifiedDateTime, sizeBytes }]  (omit q for recently used files)
 ```
 
-Both require an authenticated request (same `Chat.ReadWrite`-scoped bearer token the chat UI already sends) and return a small Buddy-owned DTO — never the raw Graph response. `top` is capped at 50 server-side.
+All four require an authenticated request (same `Chat.ReadWrite`-scoped bearer token the chat UI already sends) and return a small Buddy-owned DTO — never the raw Graph response. `top`/`days` are capped server-side (50 / 30).
 
-**Agent tools**: the chat agent (`backend/WebApp.Api/Services/AgentFrameworkService.cs`, tool catalog in `backend/WebApp.Api/Services/BuddyTools/`) can call the same Graph services as tools during a conversation — `get_user_profile` and `search_mail` — instead of the user having to hit the diagnostic endpoints above directly. Both are classified `ToolRiskLevel.Read` and execute automatically; the classification is fixed in code and the model cannot override it (see AI_CONTEXT_M365_BUDDY.md §8). There is no generic "call any Graph endpoint" tool — each tool is one narrow, named capability.
+**Agent tools**: the chat agent (`backend/WebApp.Api/Services/AgentFrameworkService.cs`, tool catalog in `backend/WebApp.Api/Services/BuddyTools/`) can call the same Graph services as tools during a conversation — `get_user_profile`, `search_mail`, `get_calendar`, `search_files` — instead of the user having to hit the diagnostic endpoints above directly. All four are classified `ToolRiskLevel.Read` and execute automatically; the classification is fixed in code and the model cannot override it (see AI_CONTEXT_M365_BUDDY.md §8). There is no generic "call any Graph endpoint" tool — each tool is one narrow, named capability.
 
 > **Important**: the Responses API rejects a client-supplied `tools` list when the request is bound to a Foundry agent (`"Not allowed when agent is specified"`). Tool *definitions* (name/description/JSON-schema) therefore live on the **Foundry agent version itself** (`definition.tools`, set via the Agents API or the Foundry portal), not in `CreateResponseOptions.Tools` in C#. `BuddyToolCatalog` in the backend is the execution side only — it must be kept in sync by hand with whatever tool definitions are published on the active agent version. `backend/WebApp.Api/Services/AgentFrameworkService.cs` still does the client-side work: detecting `FunctionCallResponseItem`s the agent emits, executing the matching `Read`-risk tool, and feeding the result back via `FunctionCallOutputResponseItem`.
 
-**How consent works**: the backend app registration's `requiredResourceAccess` (in `infra/entra-app.bicep`) declares `User.Read` + `Mail.Read`, and a declarative `oauth2PermissionGrants` resource grants admin consent for all users in the tenant at provision time — no separate portal step, no frontend scope changes. If admin consent fails at provision time (e.g. the deploying account lacks Global Administrator), grant it manually:
+**How consent works**: the backend app registration's `requiredResourceAccess` (in `infra/entra-app.bicep`) declares the four scopes above, and a declarative `oauth2PermissionGrants` resource grants admin consent for all users in the tenant at provision time — no separate portal step, no frontend scope changes. If admin consent fails at provision time (e.g. the deploying account lacks Global Administrator), grant it manually:
 
 ```powershell
 az ad app permission admin-consent --id <backend-app-client-id>

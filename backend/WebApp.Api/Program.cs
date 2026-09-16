@@ -87,13 +87,14 @@ if (!string.IsNullOrEmpty(clientId))
     builder.Configuration["AzureAd:Audience"] = $"api://{clientId}";
 }
 
-var tenantId = builder.Configuration["ENTRA_TENANT_ID"]
-    ?? builder.Configuration["AzureAd:TenantId"];
-
-if (!string.IsNullOrEmpty(tenantId))
-{
-    builder.Configuration["AzureAd:TenantId"] = tenantId;
-}
+// Multi-tenant: the app registrations are AzureADMultipleOrgs (see infra/entra-app.bicep), so
+// token issuer validation must accept ANY Entra work/school tenant, not just ours.
+// "organizations" makes Microsoft.Identity.Web validate the issuer against the multi-tenant
+// v2.0 authority instead of a single tenant's — this is Microsoft's documented pattern for
+// multi-tenant APIs, not a relaxation of validation.
+// ENTRA_TENANT_ID (our OWN tenant) is still used elsewhere (e.g. as a fallback default), but
+// must NOT be bound here or every other tenant's users would be rejected at the auth layer.
+builder.Configuration["AzureAd:TenantId"] = "organizations";
 
 const string RequiredScope = "Chat.ReadWrite";
 const string ScopePolicyName = "RequireChatScope";
@@ -139,6 +140,8 @@ builder.Services.AddScoped<AgentFrameworkService>();
 builder.Services.AddScoped<GraphOboCredentialFactory>();
 builder.Services.AddScoped<IGraphUserService, GraphUserService>();
 builder.Services.AddScoped<IGraphMailService, GraphMailService>();
+builder.Services.AddScoped<IGraphCalendarService, GraphCalendarService>();
+builder.Services.AddScoped<IGraphFilesService, GraphFilesService>();
 builder.Services.AddScoped<BuddyToolCatalog>();
 
 var app = builder.Build();
@@ -473,6 +476,44 @@ app.MapGet("/api/m365/mail/recent", async (
 })
 .RequireAuthorization(ScopePolicyName)
 .WithName("GetRecentMail");
+
+app.MapGet("/api/m365/calendar/upcoming", async (
+    IGraphCalendarService graphCalendarService,
+    IHostEnvironment environment,
+    int? days,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var events = await graphCalendarService.GetUpcomingEventsAsync(days ?? 7, cancellationToken);
+        return Results.Ok(events);
+    }
+    catch (Exception ex)
+    {
+        return MapGraphException(ex, environment);
+    }
+})
+.RequireAuthorization(ScopePolicyName)
+.WithName("GetUpcomingCalendarEvents");
+
+app.MapGet("/api/m365/files/search", async (
+    IGraphFilesService graphFilesService,
+    IHostEnvironment environment,
+    string? q,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var files = await graphFilesService.SearchFilesAsync(q, cancellationToken);
+        return Results.Ok(files);
+    }
+    catch (Exception ex)
+    {
+        return MapGraphException(ex, environment);
+    }
+})
+.RequireAuthorization(ScopePolicyName)
+.WithName("SearchFiles");
 
 // List conversations
 app.MapGet("/api/conversations", async (
