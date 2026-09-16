@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Identity.Web;
 using WebApp.Api.Models;
 using WebApp.Api.Services;
+using WebApp.Api.Services.Graph;
 using System.Security.Claims;
 
 // Load .env file for local development BEFORE building the configuration
@@ -132,6 +133,11 @@ builder.Services.AddAuthorization(options =>
 // Uses Azure.AI.Projects SDK which works with v2 Agents API (/agents/ endpoint with human-readable IDs).
 builder.Services.AddHttpClient();
 builder.Services.AddScoped<AgentFrameworkService>();
+
+// Register Microsoft Graph OBO services (M365 Buddy vertical slice)
+builder.Services.AddScoped<GraphOboCredentialFactory>();
+builder.Services.AddScoped<IGraphUserService, GraphUserService>();
+builder.Services.AddScoped<IGraphMailService, GraphMailService>();
 
 var app = builder.Build();
 
@@ -407,6 +413,64 @@ app.MapGet("/api/agent/info", async (
 })
 .RequireAuthorization(ScopePolicyName)
 .WithName("GetAgentInfo");
+
+// Microsoft Graph delegated OBO vertical slice (M365 Buddy).
+// Requires ENABLE_OBO=true deployment (see GraphOboCredentialFactory) — the frontend token
+// itself doesn't change; the backend exchanges it for a Graph token via OBO.
+static IResult MapGraphException(Exception ex, IHostEnvironment environment)
+{
+    var statusCode = ex switch
+    {
+        GraphRequestException graphEx => graphEx.StatusCode,
+        InvalidOperationException => 503, // OBO not configured / no token on request
+        _ => 500
+    };
+
+    var errorResponse = ErrorResponseFactory.CreateFromException(ex, statusCode, environment.IsDevelopment());
+    return Results.Problem(
+        title: errorResponse.Title,
+        detail: errorResponse.Detail,
+        statusCode: errorResponse.Status,
+        extensions: errorResponse.Extensions
+    );
+}
+
+app.MapGet("/api/m365/profile", async (
+    IGraphUserService graphUserService,
+    IHostEnvironment environment,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var profile = await graphUserService.GetCurrentUserAsync(cancellationToken);
+        return Results.Ok(profile);
+    }
+    catch (Exception ex)
+    {
+        return MapGraphException(ex, environment);
+    }
+})
+.RequireAuthorization(ScopePolicyName)
+.WithName("GetM365Profile");
+
+app.MapGet("/api/m365/mail/recent", async (
+    IGraphMailService graphMailService,
+    IHostEnvironment environment,
+    int? top,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var mail = await graphMailService.GetRecentMailAsync(top ?? 10, cancellationToken);
+        return Results.Ok(mail);
+    }
+    catch (Exception ex)
+    {
+        return MapGraphException(ex, environment);
+    }
+})
+.RequireAuthorization(ScopePolicyName)
+.WithName("GetRecentMail");
 
 // List conversations
 app.MapGet("/api/conversations", async (

@@ -2,7 +2,7 @@
 
 Your AI assistant for Microsoft 365 — built on Entra ID authentication and Azure AI Foundry Agent Service. Deploy to Azure Container Apps with a single command.
 
-> **Milestone status**: this is the M365 Buddy baseline — a rebrand of the upstream Foundry Agent Web App template, proven to build, run, and deploy end-to-end. It is currently a general-purpose Foundry chat assistant; it does **not** yet read email, calendar, files, Teams, or SharePoint. Microsoft Graph integrations (Mail, Calendar, OneDrive, SharePoint, Teams) are planned for a later milestone — see `AI_CONTEXT_M365_BUDDY.md` for the target architecture.
+> **Milestone status**: the M365 Buddy baseline is rebranded and deployed. A first Microsoft Graph delegated vertical slice (`GET /api/m365/profile`, `GET /api/m365/mail/recent`) is now available behind OBO — see [Microsoft Graph integration](#microsoft-graph-integration-m365-buddy) below. Calendar, files, Teams, SharePoint, and Buddy tool/approval integration are planned for later milestones — see `AI_CONTEXT_M365_BUDDY.md` for the target architecture.
 
 > **⚠️ Coming from the AI Foundry portal?** The portal's "View sample app code" gives you AI resource variables, but this app also needs an **Entra ID app registration** for authentication — which is created by `azd up`. Even if your AI Foundry resources already exist, you must run `azd up` before the app will work. See the [Foundry portal setup](#coming-from-the-ai-foundry-portal) section below.
 
@@ -423,6 +423,45 @@ This creates a backend API app registration with FIC, sets `api://{backendClient
 | **Tool identity is separate** | OBO only affects the Agent Service API caller. Agent tools (MCP, OpenAPI, Logic Apps) use the agent's identity from Foundry portal. Configure [Agent Identity](https://learn.microsoft.com/azure/ai-foundry/agents/concepts/agent-identity) separately for per-user tool access. |
 | **Conversations not user-scoped in MI mode** | MI uses a shared identity — all users see all conversations. OBO provides per-user isolation. |
 | **Local dev uses CLI credentials** | OBO requires a managed identity for FIC. Locally, the app uses `az login` credentials regardless of `ENTRA_BACKEND_CLIENT_ID`. |
+
+## Microsoft Graph Integration (M365 Buddy)
+
+The first Microsoft Graph delegated vertical slice reuses the same OBO plumbing described above — enable it with `ENABLE_OBO=true` (see [Enable OBO](#enable-obo)). There is no separate flag: when OBO is enabled, the backend app registration is also granted the Graph scopes below.
+
+**Delegated scopes requested** (least privilege, incremental — see `AI_CONTEXT_M365_BUDDY.md` §4.4 for the full planned rollout):
+
+| Scope | Purpose |
+|-------|---------|
+| `User.Read` | Read the signed-in user's own profile |
+| `Mail.Read` | Read the signed-in user's own mailbox (read-only) |
+
+**Endpoints**:
+
+```text
+GET /api/m365/profile          → { id, displayName, userPrincipalName, mail }
+GET /api/m365/mail/recent?top=10 → [{ id, subject, senderName, senderAddress, receivedDateTime, isRead, bodyPreview }]
+```
+
+Both require an authenticated request (same `Chat.ReadWrite`-scoped bearer token the chat UI already sends) and return a small Buddy-owned DTO — never the raw Graph response. `top` is capped at 50 server-side.
+
+**How consent works**: the backend app registration's `requiredResourceAccess` (in `infra/entra-app.bicep`) declares `User.Read` + `Mail.Read`, and a declarative `oauth2PermissionGrants` resource grants admin consent for all users in the tenant at provision time — no separate portal step, no frontend scope changes. If admin consent fails at provision time (e.g. the deploying account lacks Global Administrator), grant it manually:
+
+```powershell
+az ad app permission admin-consent --id <backend-app-client-id>
+```
+
+**Local development**: like the existing Foundry OBO, Graph OBO is disabled when `ASPNETCORE_ENVIRONMENT=Development` (no user-delegated token exchange locally). Calling `/api/m365/profile` or `/api/m365/mail/recent` locally returns `503` with a message explaining OBO must be enabled. To exercise these endpoints, deploy with `ENABLE_OBO=true` and call the endpoints against the deployed URL with a signed-in user's token.
+
+**Verifying**:
+
+```powershell
+# After azd up with ENABLE_OBO=true, from a signed-in browser session (DevTools → copy the
+# Authorization header the frontend sends), or via any REST client using that bearer token:
+curl -H "Authorization: Bearer <token>" https://<your-app>.azurecontainerapps.io/api/m365/profile
+curl -H "Authorization: Bearer <token>" "https://<your-app>.azurecontainerapps.io/api/m365/mail/recent?top=5"
+```
+
+A `503` means OBO isn't enabled/configured; a `403`/consent error means the Graph scopes above haven't been consented yet (run the `az ad app permission admin-consent` command above).
 
 ## Project Structure
 

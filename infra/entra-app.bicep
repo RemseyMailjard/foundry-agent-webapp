@@ -19,6 +19,12 @@ param enableObo bool = false
 var azureMachineLearningAppId = '18a66f5f-dbdf-4c17-9dd7-1634712a9cbe'
 var azureMachineLearningUserImpersonationScopeId = '1a7925b5-f871-417a-9b8b-303f9f29fa10'
 
+// Microsoft Graph — always present in every tenant. Delegated scopes for the M365 Buddy
+// Graph vertical slice (GET /api/m365/profile, GET /api/m365/mail/recent).
+var microsoftGraphAppId = '00000003-0000-0000-c000-000000000000'
+var graphUserReadScopeId = 'e1fe6dd8-ba31-4d61-89e7-88639da4683d' // User.Read
+var graphMailReadScopeId = '570282fd-fa5c-430d-a7fd-fc8dc98a9dca' // Mail.Read
+
 // Deterministic scope ID — stable across redeployments
 var chatReadWriteScopeId = guid(resourceGroup().id, environmentName, 'Chat.ReadWrite')
 
@@ -89,13 +95,27 @@ resource backendApp 'Microsoft.Graph/applications@v1.0' = if (enableObo) {
       }
     ]
   }
-  // requiredResourceAccess for Azure ML Services / user_impersonation
+  // requiredResourceAccess for Azure ML Services / user_impersonation (Foundry OBO)
+  // and Microsoft Graph User.Read + Mail.Read (M365 Buddy Graph OBO vertical slice)
   requiredResourceAccess: [
     {
       resourceAppId: azureMachineLearningAppId
       resourceAccess: [
         {
           id: azureMachineLearningUserImpersonationScopeId
+          type: 'Scope' // Delegated permission
+        }
+      ]
+    }
+    {
+      resourceAppId: microsoftGraphAppId
+      resourceAccess: [
+        {
+          id: graphUserReadScopeId
+          type: 'Scope' // Delegated permission
+        }
+        {
+          id: graphMailReadScopeId
           type: 'Scope' // Delegated permission
         }
       ]
@@ -128,6 +148,23 @@ resource oboAdminConsent 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = if (ena
   consentType: 'AllPrincipals'
   resourceId: azureMachineLearningServiceSp.id
   scope: 'user_impersonation'
+}
+
+// ============================================================================
+// Admin Consent — grant delegated permission to Microsoft Graph (M365 Buddy)
+// ============================================================================
+
+// Microsoft Graph's service principal always exists in every tenant.
+resource microsoftGraphSp 'Microsoft.Graph/servicePrincipals@v1.0' existing = if (enableObo) {
+  appId: microsoftGraphAppId
+}
+
+// Grant admin consent: backend app → Microsoft Graph / User.Read + Mail.Read
+resource graphAdminConsent 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = if (enableObo) {
+  clientId: backendSp.id
+  consentType: 'AllPrincipals'
+  resourceId: microsoftGraphSp.id
+  scope: 'User.Read Mail.Read'
 }
 
 output clientAppId string = app.appId
