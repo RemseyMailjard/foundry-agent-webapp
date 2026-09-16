@@ -2,7 +2,7 @@
 
 Your AI assistant for Microsoft 365 — built on Entra ID authentication and Azure AI Foundry Agent Service. Deploy to Azure Container Apps with a single command.
 
-> **Milestone status**: the M365 Buddy baseline is rebranded and deployed. A first Microsoft Graph delegated vertical slice (`GET /api/m365/profile`, `GET /api/m365/mail/recent`) is now available behind OBO — see [Microsoft Graph integration](#microsoft-graph-integration-m365-buddy) below. Calendar, files, Teams, SharePoint, and Buddy tool/approval integration are planned for later milestones — see `AI_CONTEXT_M365_BUDDY.md` for the target architecture.
+> **Milestone status**: the M365 Buddy baseline is rebranded and deployed. A Microsoft Graph delegated vertical slice (`GET /api/m365/profile`, `GET /api/m365/mail/recent`) is available behind OBO, and the chat agent can now call `get_user_profile` and `search_mail` as read-only tools during a conversation — see [Microsoft Graph integration](#microsoft-graph-integration-m365-buddy) below. Calendar, files, Teams, SharePoint, write actions, and approvals are planned for later milestones — see `AI_CONTEXT_M365_BUDDY.md` for the target architecture.
 
 > **⚠️ Coming from the AI Foundry portal?** The portal's "View sample app code" gives you AI resource variables, but this app also needs an **Entra ID app registration** for authentication — which is created by `azd up`. Even if your AI Foundry resources already exist, you must run `azd up` before the app will work. See the [Foundry portal setup](#coming-from-the-ai-foundry-portal) section below.
 
@@ -443,6 +443,10 @@ GET /api/m365/mail/recent?top=10 → [{ id, subject, senderName, senderAddress, 
 ```
 
 Both require an authenticated request (same `Chat.ReadWrite`-scoped bearer token the chat UI already sends) and return a small Buddy-owned DTO — never the raw Graph response. `top` is capped at 50 server-side.
+
+**Agent tools**: the chat agent (`backend/WebApp.Api/Services/AgentFrameworkService.cs`, tool catalog in `backend/WebApp.Api/Services/BuddyTools/`) can call the same Graph services as tools during a conversation — `get_user_profile` and `search_mail` — instead of the user having to hit the diagnostic endpoints above directly. Both are classified `ToolRiskLevel.Read` and execute automatically; the classification is fixed in code and the model cannot override it (see AI_CONTEXT_M365_BUDDY.md §8). There is no generic "call any Graph endpoint" tool — each tool is one narrow, named capability.
+
+> **Important**: the Responses API rejects a client-supplied `tools` list when the request is bound to a Foundry agent (`"Not allowed when agent is specified"`). Tool *definitions* (name/description/JSON-schema) therefore live on the **Foundry agent version itself** (`definition.tools`, set via the Agents API or the Foundry portal), not in `CreateResponseOptions.Tools` in C#. `BuddyToolCatalog` in the backend is the execution side only — it must be kept in sync by hand with whatever tool definitions are published on the active agent version. `backend/WebApp.Api/Services/AgentFrameworkService.cs` still does the client-side work: detecting `FunctionCallResponseItem`s the agent emits, executing the matching `Read`-risk tool, and feeding the result back via `FunctionCallOutputResponseItem`.
 
 **How consent works**: the backend app registration's `requiredResourceAccess` (in `infra/entra-app.bicep`) declares `User.Read` + `Mail.Read`, and a declarative `oauth2PermissionGrants` resource grants admin consent for all users in the tenant at provision time — no separate portal step, no frontend scope changes. If admin consent fails at provision time (e.g. the deploying account lacks Global Administrator), grant it manually:
 

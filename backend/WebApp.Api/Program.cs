@@ -3,6 +3,7 @@ using Microsoft.Identity.Web;
 using WebApp.Api.Models;
 using WebApp.Api.Services;
 using WebApp.Api.Services.Graph;
+using WebApp.Api.Services.BuddyTools;
 using System.Security.Claims;
 
 // Load .env file for local development BEFORE building the configuration
@@ -138,6 +139,7 @@ builder.Services.AddScoped<AgentFrameworkService>();
 builder.Services.AddScoped<GraphOboCredentialFactory>();
 builder.Services.AddScoped<IGraphUserService, GraphUserService>();
 builder.Services.AddScoped<IGraphMailService, GraphMailService>();
+builder.Services.AddScoped<BuddyToolCatalog>();
 
 var app = builder.Build();
 

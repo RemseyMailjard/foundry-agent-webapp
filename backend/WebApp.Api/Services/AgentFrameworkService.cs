@@ -9,6 +9,7 @@ using Microsoft.Identity.Client;
 using Microsoft.Identity.Web;
 using System.Runtime.CompilerServices;
 using WebApp.Api.Models;
+using WebApp.Api.Services.BuddyTools;
 
 namespace WebApp.Api.Services;
 
@@ -51,6 +52,7 @@ public class AgentFrameworkService : IDisposable
     private static ManagedIdentityClientAssertion? s_miAssertion;
 
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly BuddyToolCatalog _buddyToolCatalog;
 
     /// <summary>
     /// Prefix applied to image files this web app uploads to the Foundry Files API,
@@ -67,10 +69,12 @@ public class AgentFrameworkService : IDisposable
         IConfiguration configuration,
         ILogger<AgentFrameworkService> logger,
         IHttpClientFactory httpClientFactory,
+        BuddyToolCatalog buddyToolCatalog,
         IHttpContextAccessor? httpContextAccessor = null)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
+        _buddyToolCatalog = buddyToolCatalog;
         _httpContextAccessor = httpContextAccessor;
 
         _agentEndpoint = configuration["AI_AGENT_ENDPOINT"]
@@ -335,6 +339,14 @@ public class AgentFrameworkService : IDisposable
                 new AgentReference(_agentId, resolvedVersion),
                 conversationId);
 
+        // Buddy tools (M365 Buddy vertical slice) — narrow, read-only Graph tools, not a generic
+        // "graph_request" passthrough. See AI_CONTEXT_M365_BUDDY.md §7-8.
+        // NOTE: tools are declared on the Foundry agent itself (agent version's `definition.tools`),
+        // not passed client-side here — the Responses API rejects `options.Tools` when an
+        // AgentReference is specified ("Not allowed when agent is specified"). This dictionary is
+        // only used to execute the calls the agent-defined tools produce and to look up display names.
+        var buddyToolsByName = _buddyToolCatalog.GetTools().ToDictionary(t => t.Name);
+
         // If continuing from MCP approval, add approval response items
         // Don't set PreviousResponseId — the API rejects it with conversation binding,
         // and the conversation already tracks the pending MCP state
@@ -343,7 +355,7 @@ public class AgentFrameworkService : IDisposable
             options.InputItems.Add(ResponseItem.CreateMcpApprovalResponseItem(
                 mcpApproval.ApprovalRequestId,
                 mcpApproval.Approved));
-            
+
             _logger.LogInformation(
                 "Resuming with MCP approval: RequestId={RequestId}, Approved={Approved}",
                 mcpApproval.ApprovalRequestId,
@@ -367,106 +379,203 @@ public class AgentFrameworkService : IDisposable
         // Track the current response ID for MCP approval resume flow
         string? currentResponseId = null;
 
-        await foreach (StreamingResponseUpdate update
-            in responsesClient.CreateResponseStreamingAsync(
-                options: options,
-                cancellationToken: cancellationToken))
+        // Buddy function-call tools require a client-side round trip: the model requests a
+        // call, we execute it locally (Read-risk tools only — see ExecuteBuddyToolAsync), and
+        // feed the result back as a new turn in the same conversation. Bounded to avoid a
+        // runaway loop if the model keeps requesting calls.
+        const int MaxToolIterations = 5;
+        var currentOptions = options;
+        for (var iteration = 0; ; iteration++)
         {
-            // Capture response ID from created event (needed for MCP approval resume)
-            if (update is StreamingResponseCreatedUpdate createdUpdate)
-            {
-                currentResponseId = createdUpdate.Response.Id;
-                _logger.LogDebug("Response created: {ResponseId}", currentResponseId);
-                continue;
-            }
+            var pendingFunctionCalls = new List<(string CallId, string FunctionName, string ArgumentsJson)>();
 
-            if (update is StreamingResponseOutputTextDeltaUpdate deltaUpdate)
+            await foreach (StreamingResponseUpdate update
+                in responsesClient.CreateResponseStreamingAsync(
+                    options: currentOptions,
+                    cancellationToken: cancellationToken))
             {
-                yield return StreamChunk.Text(deltaUpdate.Delta);
-            }
-            else if (update is StreamingResponseOutputItemDoneUpdate itemDoneUpdate)
-            {
-                // Check for MCP tool approval request
-                if (itemDoneUpdate.Item is McpToolCallApprovalRequestItem mcpApprovalItem)
+                // Capture response ID from created event (needed for MCP approval resume)
+                if (update is StreamingResponseCreatedUpdate createdUpdate)
                 {
-                    _logger.LogInformation(
-                        "MCP tool approval requested: Id={Id}, Tool={Tool}, Server={Server}",
-                        mcpApprovalItem.Id,
-                        mcpApprovalItem.ToolName,
-                        mcpApprovalItem.ServerLabel);
-                    
-                    // Parse tool arguments from BinaryData to string (JSON)
-                    string? argumentsJson = mcpApprovalItem.ToolArguments?.ToString();
-                    
-                    yield return StreamChunk.McpApproval(new McpApprovalRequest
-                    {
-                        Id = mcpApprovalItem.Id,
-                        ToolName = mcpApprovalItem.ToolName ?? "Unknown tool",
-                        ServerLabel = mcpApprovalItem.ServerLabel ?? "MCP Server",
-                        Arguments = argumentsJson,
-                        PreviousResponseId = currentResponseId
-                    });
+                    currentResponseId = createdUpdate.Response.Id;
+                    _logger.LogDebug("Response created: {ResponseId}", currentResponseId);
                     continue;
                 }
-                
-                // Capture file search results for quote extraction
-                if (itemDoneUpdate.Item is FileSearchCallResponseItem fileSearchItem)
+
+                if (update is StreamingResponseOutputTextDeltaUpdate deltaUpdate)
                 {
-                    foreach (var result in fileSearchItem.Results)
+                    yield return StreamChunk.Text(deltaUpdate.Delta);
+                }
+                else if (update is StreamingResponseOutputItemDoneUpdate itemDoneUpdate)
+                {
+                    // Buddy tool call requested by the model — execute after this stream turn ends.
+                    if (itemDoneUpdate.Item is FunctionCallResponseItem functionCallItem)
                     {
-                        if (!string.IsNullOrEmpty(result.FileId) && !string.IsNullOrEmpty(result.Text))
-                        {
-                            fileSearchQuotes[result.FileId] = result.Text;
-                            _logger.LogDebug(
-                                "Captured file search quote for FileId={FileId}, QuoteLength={Length}", 
-                                result.FileId, 
-                                result.Text.Length);
-                        }
+                        _logger.LogInformation(
+                            "Buddy tool call requested: {ToolName} (CallId={CallId})",
+                            functionCallItem.FunctionName,
+                            functionCallItem.CallId);
+
+                        pendingFunctionCalls.Add((
+                            functionCallItem.CallId,
+                            functionCallItem.FunctionName,
+                            functionCallItem.FunctionArguments?.ToString() ?? "{}"));
+                        continue;
                     }
-                    continue;
-                }
-                
-                // Extract annotations/citations from completed output items
-                var annotations = ExtractAnnotations(itemDoneUpdate.Item, fileSearchQuotes);
-                if (annotations.Count > 0)
-                {
-                    _logger.LogInformation("Extracted {Count} annotations from response", annotations.Count);
-                    yield return StreamChunk.WithAnnotations(annotations);
-                }
-            }
-            else if (update is StreamingResponseOutputItemAddedUpdate itemAddedUpdate)
-            {
-                // Detect tool-use steps and signal the frontend for progress indicators
-                string? toolName = itemAddedUpdate.Item switch
-                {
-                    FileSearchCallResponseItem => "file_search",
-                    CodeInterpreterCallResponseItem => "code_interpreter",
-                    _ when itemAddedUpdate.Item?.GetType().Name.Contains("ToolCall") == true => "function_call",
-                    _ => null
-                };
 
-                if (toolName != null)
+                    // Check for MCP tool approval request
+                    if (itemDoneUpdate.Item is McpToolCallApprovalRequestItem mcpApprovalItem)
+                    {
+                        _logger.LogInformation(
+                            "MCP tool approval requested: Id={Id}, Tool={Tool}, Server={Server}",
+                            mcpApprovalItem.Id,
+                            mcpApprovalItem.ToolName,
+                            mcpApprovalItem.ServerLabel);
+
+                        // Parse tool arguments from BinaryData to string (JSON)
+                        string? argumentsJson = mcpApprovalItem.ToolArguments?.ToString();
+
+                        yield return StreamChunk.McpApproval(new McpApprovalRequest
+                        {
+                            Id = mcpApprovalItem.Id,
+                            ToolName = mcpApprovalItem.ToolName ?? "Unknown tool",
+                            ServerLabel = mcpApprovalItem.ServerLabel ?? "MCP Server",
+                            Arguments = argumentsJson,
+                            PreviousResponseId = currentResponseId
+                        });
+                        continue;
+                    }
+
+                    // Capture file search results for quote extraction
+                    if (itemDoneUpdate.Item is FileSearchCallResponseItem fileSearchItem)
+                    {
+                        foreach (var result in fileSearchItem.Results)
+                        {
+                            if (!string.IsNullOrEmpty(result.FileId) && !string.IsNullOrEmpty(result.Text))
+                            {
+                                fileSearchQuotes[result.FileId] = result.Text;
+                                _logger.LogDebug(
+                                    "Captured file search quote for FileId={FileId}, QuoteLength={Length}",
+                                    result.FileId,
+                                    result.Text.Length);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Extract annotations/citations from completed output items
+                    var annotations = ExtractAnnotations(itemDoneUpdate.Item, fileSearchQuotes);
+                    if (annotations.Count > 0)
+                    {
+                        _logger.LogInformation("Extracted {Count} annotations from response", annotations.Count);
+                        yield return StreamChunk.WithAnnotations(annotations);
+                    }
+                }
+                else if (update is StreamingResponseOutputItemAddedUpdate itemAddedUpdate)
                 {
-                    _logger.LogDebug("Tool use detected: {ToolName}", toolName);
-                    yield return StreamChunk.ToolUse(toolName);
+                    // Detect tool-use steps and signal the frontend for progress indicators
+                    string? toolName = itemAddedUpdate.Item switch
+                    {
+                        FunctionCallResponseItem fnItem => buddyToolsByName.TryGetValue(fnItem.FunctionName ?? "", out var def)
+                            ? def.DisplayName
+                            : fnItem.FunctionName,
+                        FileSearchCallResponseItem => "file_search",
+                        CodeInterpreterCallResponseItem => "code_interpreter",
+                        _ when itemAddedUpdate.Item?.GetType().Name.Contains("ToolCall") == true => "function_call",
+                        _ => null
+                    };
+
+                    if (toolName != null)
+                    {
+                        _logger.LogDebug("Tool use detected: {ToolName}", toolName);
+                        yield return StreamChunk.ToolUse(toolName);
+                    }
+                }
+                else if (update is StreamingResponseCompletedUpdate completedUpdate)
+                {
+                    _lastUsage = completedUpdate.Response.Usage;
+                }
+                else if (update is StreamingResponseErrorUpdate errorUpdate)
+                {
+                    _logger.LogError("Stream error: {Error}", errorUpdate.Message);
+                    throw new InvalidOperationException($"Stream error: {errorUpdate.Message}");
+                }
+                else
+                {
+                    _logger.LogDebug("Unhandled stream update type: {Type}", update.GetType().Name);
                 }
             }
-            else if (update is StreamingResponseCompletedUpdate completedUpdate)
+
+            if (pendingFunctionCalls.Count == 0)
             {
-                _lastUsage = completedUpdate.Response.Usage;
+                break;
             }
-            else if (update is StreamingResponseErrorUpdate errorUpdate)
+
+            if (iteration >= MaxToolIterations)
             {
-                _logger.LogError("Stream error: {Error}", errorUpdate.Message);
-                throw new InvalidOperationException($"Stream error: {errorUpdate.Message}");
+                _logger.LogWarning(
+                    "Buddy tool call loop hit MaxToolIterations={Max} for conversation {ConversationId}; stopping.",
+                    MaxToolIterations, conversationId);
+                break;
             }
-            else
+
+            // Execute each requested tool and feed the results back as the next turn.
+            var nextOptions = new CreateResponseOptions { StreamingEnabled = true };
+
+            foreach (var call in pendingFunctionCalls)
             {
-                _logger.LogDebug("Unhandled stream update type: {Type}", update.GetType().Name);
+                var outputJson = await ExecuteBuddyToolAsync(call.FunctionName, call.ArgumentsJson, buddyToolsByName, cancellationToken);
+                nextOptions.InputItems.Add(ResponseItem.CreateFunctionCallOutputItem(call.CallId, outputJson));
             }
+
+            currentOptions = nextOptions;
         }
 
         _logger.LogInformation("Completed streaming for conversation: {ConversationId}", conversationId);
+    }
+
+    /// <summary>
+    /// Executes a Buddy tool the model requested. Only <see cref="ToolRiskLevel.Read"/> tools
+    /// run automatically — the model's classification is never trusted, only the fixed
+    /// <see cref="BuddyToolDefinition.RiskLevel"/> registered in <see cref="BuddyToolCatalog"/>.
+    /// Write/HighImpact tools aren't in the catalog yet (approval flow not implemented — see
+    /// AI_CONTEXT_M365_BUDDY.md §9), so this is a defensive guard for when they are added.
+    /// </summary>
+    private async Task<string> ExecuteBuddyToolAsync(
+        string functionName,
+        string argumentsJson,
+        IReadOnlyDictionary<string, BuddyToolDefinition> toolsByName,
+        CancellationToken cancellationToken)
+    {
+        if (!toolsByName.TryGetValue(functionName, out var tool))
+        {
+            _logger.LogWarning("Buddy tool call requested for unknown tool: {ToolName}", functionName);
+            return System.Text.Json.JsonSerializer.Serialize(new { error = $"Unknown tool '{functionName}'." });
+        }
+
+        if (tool.RiskLevel != ToolRiskLevel.Read)
+        {
+            _logger.LogWarning(
+                "Refusing to auto-execute non-Read Buddy tool: {ToolName} (risk={RiskLevel})",
+                tool.Name, tool.RiskLevel);
+            return System.Text.Json.JsonSerializer.Serialize(new
+            {
+                error = $"'{tool.Name}' requires user approval, which is not yet implemented. This action was not performed."
+            });
+        }
+
+        try
+        {
+            return await tool.ExecuteAsync(argumentsJson, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Buddy tool execution failed: {ToolName}", tool.Name);
+            return System.Text.Json.JsonSerializer.Serialize(new
+            {
+                error = $"'{tool.Name}' failed: {ex.Message}"
+            });
+        }
     }
 
     /// <summary>
