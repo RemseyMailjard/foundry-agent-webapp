@@ -129,11 +129,6 @@
   box-shadow: var(--shadow16);
 }
 
-/* Built with badge - centered under input */
-.builtWithBadge {
-  padding-bottom: 0.5rem;
-}
-
 .editBanner {
   display: flex;
   align-items: center;
